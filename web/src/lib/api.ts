@@ -213,6 +213,40 @@ export interface ModelDoc {
   source: string;
 }
 
+export interface RetrainedVersion {
+  id: number;
+  model_id: string;
+  version: string;
+  status: "PROMOTED" | "CHALLENGER" | "ARCHIVED" | "READY" | "REJECTED";
+  recommendation: "PROMOTE" | "HOLD" | "REJECT";
+  confidence: number;
+  created_at: string;
+  triggered_by_event?: string;
+  trigger_reason?: string;
+  metric_name: string;
+  champion_metric: number;
+  challenger_metric: number;
+  overall_delta: number;
+  segment_name: string;
+  champion_segment_metric?: number;
+  challenger_segment_metric?: number;
+  segment_delta?: number;
+  reasoning?: string;
+  training_samples?: number;
+  source?: string;
+}
+
+export interface ModelVersionsResponse {
+  model_id: string;
+  current_version: string;
+  accuracy?: number;
+  retrain_recommended: boolean;
+  retrain_blocked: boolean;
+  block_reason?: string;
+  latest_event?: string;
+  versions: RetrainedVersion[];
+}
+
 export interface ChatReply {
   answer: string;
   scope: "model" | "fleet";
@@ -338,6 +372,20 @@ export const api = {
   liveEventDetail: (id: string) => request<EventDetail>(`/api/live/events/${id}`),
   modelDocs: (id: string) =>
     request<ModelDoc>(`/api/models/${encodeURIComponent(id)}/docs`),
+  modelVersions: (id: string) =>
+    request<ModelVersionsResponse>(`/api/models/${encodeURIComponent(id)}/versions`),
+  promoteVersion: (id: string, version: string) =>
+    post<{ status: string; version: string }>(
+      `/api/models/${encodeURIComponent(id)}/promote`,
+      { version },
+    ),
+  rollbackVersion: (id: string, version?: string) =>
+    post<{ status: string; current_version: string }>(
+      `/api/models/${encodeURIComponent(id)}/rollback`,
+      { version },
+    ),
+  triggerRetrain: (id: string) =>
+    post<RetrainedVersion>(`/api/models/${encodeURIComponent(id)}/retrain`),
 
   // chat
   chatModel: (id: string, question: string, history: { role: string; content: string }[] = []) =>

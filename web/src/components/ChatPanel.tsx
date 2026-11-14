@@ -79,17 +79,22 @@ export function ChatPanel({
       : await api.chatFleet(question, history);
 
     setTurns((prev) => {
-      const next = [...prev];
-      const last = next[next.length - 1];
-      if (res.data) {
-        last.content = res.data.answer;
-        last.source = res.data.source;
-      } else {
-        last.content = res.error ?? "Request failed.";
-        last.error = true;
-      }
-      last.pending = false;
-      return next;
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      const updated: Turn = res.data
+        ? {
+            ...last,
+            content: res.data.answer,
+            source: res.data.source,
+            pending: false,
+          }
+        : {
+            ...last,
+            content: res.error ?? "Request failed.",
+            error: true,
+            pending: false,
+          };
+      return [...prev.slice(0, -1), updated];
     });
     setBusy(false);
   };

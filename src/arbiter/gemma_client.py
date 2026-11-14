@@ -189,7 +189,7 @@ class GemmaClient:
             self.cache_hits += 1
             return cache[key]
 
-        config: dict[str, Any] = {"temperature": self.temperature}
+        config: dict[str, Any] = {"temperature": self.temperature, "max_output_tokens": 1024}
         if system:
             config["system_instruction"] = system
 

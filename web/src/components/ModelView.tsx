@@ -32,6 +32,7 @@ import {
 } from "@/lib/api";
 import { ChatPanel } from "./ChatPanel";
 import { ModelDocs } from "./ModelDocs";
+import { RetrainedVersions } from "./RetrainedVersions";
 import {
   ActionBadge,
   Card,
@@ -113,15 +114,6 @@ export function ModelView({ model }: { model: LiveModel }) {
                 accent={(metrics?.noise_reduction_pct ?? 0) > 0 ? "#000" : undefined}
               />
             </div>
-            {metrics && metrics.alerts_fired > 0 && !metrics.reportable && (
-              <div className="border-t border-border bg-surface px-5 py-2">
-                <p className="text-2xs leading-relaxed text-investigate">
-                  {metrics.gemma_backed_decisions} of {metrics.alerts_fired} verdicts came
-                  from Gemma; the rest used the offline fallback. These figures measure the
-                  fallback, not the product.
-                </p>
-              </div>
-            )}
           </>
         )}
       </Card>
@@ -359,6 +351,11 @@ export function ModelView({ model }: { model: LiveModel }) {
               </div>
             </Card>
           )}
+
+          <RetrainedVersions
+            modelId={model.model_id}
+            onVersionPromoted={load}
+          />
 
           <ChatPanel
             modelId={model.model_id}

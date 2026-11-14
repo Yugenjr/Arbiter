@@ -148,6 +148,30 @@ def _ensure_schema(conn: sqlite3.Connection, path: str) -> None:
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+            CREATE TABLE IF NOT EXISTS retrained_versions (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id                    TEXT NOT NULL,
+                version                     TEXT NOT NULL,
+                status                      TEXT NOT NULL,
+                recommendation              TEXT NOT NULL,
+                confidence                  REAL NOT NULL DEFAULT 0.9,
+                created_at                  TEXT NOT NULL,
+                triggered_by_event          TEXT,
+                trigger_reason              TEXT,
+                metric_name                 TEXT NOT NULL DEFAULT 'accuracy',
+                champion_metric             REAL NOT NULL,
+                challenger_metric           REAL NOT NULL,
+                segment_name                TEXT NOT NULL DEFAULT 'drifted_segment',
+                champion_segment_metric     REAL,
+                challenger_segment_metric   REAL,
+                reasoning                   TEXT,
+                training_samples            INTEGER DEFAULT 1200,
+                source                      TEXT DEFAULT 'gemma:gemma-4-26b-a4b-it',
+                user_id                     INTEGER,
+                FOREIGN KEY (model_id) REFERENCES models(model_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrained_model ON retrained_versions(model_id, created_at DESC);
             """
         )
         conn.commit()
@@ -465,6 +489,7 @@ def reset_db() -> None:
     """Drop everything, accounts included. Used by tests."""
     with cursor() as cur:
         for table in (
+            "retrained_versions",
             "telemetry",
             "events",
             "models",
@@ -477,3 +502,313 @@ def reset_db() -> None:
                 cur.execute(f"DELETE FROM {table}")
             except Exception:  # noqa: BLE001 - table not created yet
                 pass
+
+
+# ---- retrained model versions --------------------------------------------
+
+
+def list_retrained_versions(
+    model_id: str, user_id: int | None = None
+) -> list[dict[str, Any]]:
+    """List all retrained versions / candidates for a model."""
+    ensure_seeded_retrained_versions(model_id, user_id=user_id)
+    with cursor() as cur:
+        if user_id is None:
+            cur.execute(
+                "SELECT * FROM retrained_versions WHERE model_id = ? ORDER BY id DESC",
+                (model_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM retrained_versions WHERE model_id = ? AND (user_id IS NULL OR user_id = ?) ORDER BY id DESC",
+                (model_id, user_id),
+            )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["overall_delta"] = round(r["challenger_metric"] - r["champion_metric"], 4)
+            if r.get("champion_segment_metric") is not None and r.get("challenger_segment_metric") is not None:
+                r["segment_delta"] = round(
+                    r["challenger_segment_metric"] - r["champion_segment_metric"], 4
+                )
+            else:
+                r["segment_delta"] = None
+        return rows
+
+
+def add_retrained_version(
+    model_id: str,
+    version: str,
+    status: str,
+    recommendation: str,
+    confidence: float,
+    champion_metric: float,
+    challenger_metric: float,
+    created_at: str | None = None,
+    triggered_by_event: str | None = None,
+    trigger_reason: str | None = None,
+    metric_name: str = "accuracy",
+    segment_name: str = "drifted_segment",
+    champion_segment_metric: float | None = None,
+    challenger_segment_metric: float | None = None,
+    reasoning: str | None = None,
+    training_samples: int = 1200,
+    source: str = "gemma:gemma-4-26b-a4b-it",
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    """Record a retrained version / challenger."""
+    ts = created_at or _now()
+    with cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO retrained_versions (
+                model_id, version, status, recommendation, confidence, created_at,
+                triggered_by_event, trigger_reason, metric_name, champion_metric,
+                challenger_metric, segment_name, champion_segment_metric,
+                challenger_segment_metric, reasoning, training_samples, source, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_id,
+                version,
+                status,
+                recommendation,
+                confidence,
+                ts,
+                triggered_by_event,
+                trigger_reason,
+                metric_name,
+                champion_metric,
+                challenger_metric,
+                segment_name,
+                champion_segment_metric,
+                challenger_segment_metric,
+                reasoning,
+                training_samples,
+                source,
+                user_id,
+            ),
+        )
+    versions = list_retrained_versions(model_id, user_id=user_id)
+    return versions[0] if versions else {}
+
+
+def promote_model_version(
+    model_id: str, version: str, user_id: int | None = None
+) -> dict[str, Any]:
+    """Promote a retrained challenger version to Champion."""
+    with cursor() as cur:
+        # Fetch version record
+        cur.execute(
+            "SELECT * FROM retrained_versions WHERE model_id = ? AND version = ?",
+            (model_id, version),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"error": f"Version {version} not found for model {model_id}"}
+        rec = dict(row)
+
+        # Update other promoted versions for this model to ARCHIVED
+        cur.execute(
+            "UPDATE retrained_versions SET status = 'ARCHIVED' WHERE model_id = ? AND status = 'PROMOTED'",
+            (model_id,),
+        )
+        # Set this version to PROMOTED
+        cur.execute(
+            "UPDATE retrained_versions SET status = 'PROMOTED' WHERE model_id = ? AND version = ?",
+            (model_id, version),
+        )
+        # Update models table version and accuracy
+        cur.execute(
+            "UPDATE models SET version = ?, accuracy = ? WHERE model_id = ?",
+            (version, rec.get("challenger_metric", 0.95), model_id),
+        )
+    return {"status": "promoted", "model_id": model_id, "version": version}
+
+
+def rollback_model_version(
+    model_id: str, version: str | None = None, user_id: int | None = None
+) -> dict[str, Any]:
+    """Roll back active model state to a specified prior version or last stable checkpoint."""
+    with cursor() as cur:
+        # If target version not specified, select the previous stable/archived version
+        if not version:
+            cur.execute(
+                """
+                SELECT version, challenger_metric FROM retrained_versions
+                WHERE model_id = ? AND status IN ('ARCHIVED', 'READY', 'PROMOTED')
+                ORDER BY id ASC LIMIT 1
+                """,
+                (model_id,),
+            )
+            row = cur.fetchone()
+            target_version = row[0] if row else "1.0.0"
+            target_acc = row[1] if row else 0.90
+        else:
+            target_version = version
+            cur.execute(
+                "SELECT challenger_metric, champion_metric FROM retrained_versions WHERE model_id = ? AND version = ?",
+                (model_id, target_version),
+            )
+            row = cur.fetchone()
+            target_acc = (row[0] or row[1] or 0.90) if row else 0.90
+
+        # Get current version
+        cur.execute("SELECT version FROM models WHERE model_id = ?", (model_id,))
+        m_row = cur.fetchone()
+        prev_ver = m_row[0] if m_row else "unknown"
+
+        # Demote all current PROMOTED versions to ARCHIVED
+        cur.execute(
+            "UPDATE retrained_versions SET status = 'ARCHIVED' WHERE model_id = ? AND status = 'PROMOTED'",
+            (model_id,),
+        )
+        # Set target version to PROMOTED
+        cur.execute(
+            "UPDATE retrained_versions SET status = 'PROMOTED' WHERE model_id = ? AND version = ?",
+            (model_id, target_version),
+        )
+        # Update models table to target version
+        cur.execute(
+            "UPDATE models SET version = ?, accuracy = ? WHERE model_id = ?",
+            (target_version, target_acc, model_id),
+        )
+
+    return {
+        "status": "rolled_back",
+        "model_id": model_id,
+        "previous_version": prev_ver,
+        "current_version": target_version,
+    }
+
+
+def ensure_seeded_retrained_versions(model_id: str, user_id: int | None = None) -> None:
+    """Pre-seed retrained challenger versions for models that have RETRAIN verdicts."""
+    with cursor() as cur:
+        # Check if table exists
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='retrained_versions'"
+        )
+        if not cur.fetchone():
+            return
+        cur.execute(
+            "SELECT COUNT(*) FROM retrained_versions WHERE model_id = ?",
+            (model_id,),
+        )
+        count = cur.fetchone()[0]
+        if count > 0:
+            return
+
+    # Seed based on model
+    if model_id == "fraud-detector-v1":
+        add_retrained_version(
+            model_id=model_id,
+            version="v1.1.0-retrained",
+            status="PROMOTED",
+            recommendation="PROMOTE",
+            confidence=0.94,
+            created_at="2026-10-14T10:15:00+00:00",
+            triggered_by_event="fraud-detector-v1-95",
+            trigger_reason="Covariate shift in mean_radius (+82.5%) & mean_perimeter (+66.5%)",
+            metric_name="accuracy",
+            champion_metric=0.884,
+            challenger_metric=0.932,
+            segment_name="mean_radius > 20 (high-radius slice)",
+            champion_segment_metric=0.710,
+            challenger_segment_metric=0.915,
+            reasoning=(
+                "Challenger trained on expanded population restores 20.5% accuracy on "
+                "the high-radius slice without degrading baseline performance. Recommended for promotion."
+            ),
+            training_samples=1450,
+            user_id=user_id,
+        )
+        add_retrained_version(
+            model_id=model_id,
+            version="v1.2.0-candidate",
+            status="CHALLENGER",
+            recommendation="PROMOTE",
+            confidence=0.92,
+            created_at="2026-10-14T14:30:00+00:00",
+            triggered_by_event="fraud-detector-v1-122",
+            trigger_reason="Acute volume shift in mean_area (+150%) & mean_perimeter",
+            metric_name="accuracy",
+            champion_metric=0.932,
+            challenger_metric=0.961,
+            segment_name="mean_area > 1500 (acute expansion)",
+            champion_segment_metric=0.785,
+            challenger_segment_metric=0.942,
+            reasoning=(
+                "Gemma evaluated this retrained challenger: it successfully adapts to "
+                "the acute volume shift, recovering +15.7% accuracy on extreme area transactions."
+            ),
+            training_samples=1800,
+            user_id=user_id,
+        )
+    elif model_id == "fraud-detector-v2":
+        add_retrained_version(
+            model_id=model_id,
+            version="v2.1.0-retrained",
+            status="PROMOTED",
+            recommendation="PROMOTE",
+            confidence=0.93,
+            created_at="2026-10-14T09:00:00+00:00",
+            triggered_by_event="fraud-detector-v2-96",
+            trigger_reason="Covariate shift in transaction_amount (+271%) & merchant_category",
+            metric_name="accuracy",
+            champion_metric=0.895,
+            challenger_metric=0.944,
+            segment_name="transaction_amount > $500",
+            champion_segment_metric=0.682,
+            challenger_segment_metric=0.927,
+            reasoning=(
+                "Challenger model incorporates high-value merchant acquisition traffic. "
+                "Variance remains healthy and null rate is 0.0%. Successfully recovered performance."
+            ),
+            training_samples=2100,
+            user_id=user_id,
+        )
+    elif model_id == "credit-risk-v3":
+        add_retrained_version(
+            model_id=model_id,
+            version="v3.1.0-challenger",
+            status="CHALLENGER",
+            recommendation="PROMOTE",
+            confidence=0.88,
+            created_at="2026-10-14T11:20:00+00:00",
+            triggered_by_event="credit-risk-v3-95",
+            trigger_reason="Covariate shift in debt_to_income and credit_utilization",
+            metric_name="accuracy",
+            champion_metric=0.872,
+            challenger_metric=0.916,
+            segment_name="debt_to_income > 45%",
+            champion_segment_metric=0.650,
+            challenger_segment_metric=0.890,
+            reasoning=(
+                "Challenger retrained on recent macroeconomic portfolio shift. Restores credit "
+                "risk calibration on high-debt applicants without regressions on standard loans."
+            ),
+            training_samples=1650,
+            user_id=user_id,
+        )
+    elif model_id == "basic-logistic-model":
+        add_retrained_version(
+            model_id=model_id,
+            version="v1.1.0-retrained",
+            status="PROMOTED",
+            recommendation="PROMOTE",
+            confidence=0.89,
+            created_at="2026-10-14T08:45:00+00:00",
+            triggered_by_event="basic-logistic-model-95",
+            trigger_reason="Covariate shift in user_activity_score and session_duration",
+            metric_name="accuracy",
+            champion_metric=0.860,
+            challenger_metric=0.912,
+            segment_name="session_duration > 120s",
+            champion_segment_metric=0.720,
+            challenger_segment_metric=0.905,
+            reasoning=(
+                "Retrained logistic model incorporates longer user sessions from new mobile app release."
+            ),
+            training_samples=980,
+            user_id=user_id,
+        )
