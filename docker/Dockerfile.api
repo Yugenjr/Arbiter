@@ -1,9 +1,6 @@
-# Arbiter API — FastAPI + DriftGuard SDK + Gemma 4
+# Arbiter API — FastAPI + DriftGuard SDK + Gemma 4 
 FROM python:3.11-slim
-
 WORKDIR /app
-
-# System deps kept minimal; scikit-learn/numpy ship wheels so no build toolchain needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
